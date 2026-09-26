@@ -471,8 +471,9 @@ enum PageOutcome {
 #[derive(Debug)]
 enum Fetched {
     /// The decoded body, and the encoding `chardetng` guessed when nothing
-    /// declared one and the body was not UTF-8 (see [`decode_text`]).
-    Text(String, Option<&'static Encoding>),
+    /// declared one and the body was not UTF-8 (see [`decode_text`]), and the
+    /// HTTP status.
+    Text(String, Option<&'static Encoding>, u16),
     /// Raw `Location` value of a 301, 302, 303, 307 or 308 answer.
     Redirect(String),
 }
@@ -484,7 +485,21 @@ enum FetchFailure {
     SlowDown(u16, Duration),
     /// A redirect status without a usable `Location` header.
     BadRedirect(u16),
-    TooLarge,
+    /// The body passed [`MAX_BODY_BYTES`]; carries the HTTP status.
+    TooLarge(u16),
+}
+
+impl FetchFailure {
+    /// HTTP status of the answer, when one was received.
+    fn status(&self) -> Option<u16> {
+        match self {
+            Self::Transport(error) => error.status().map(|status| status.as_u16()),
+            Self::Status(code)
+            | Self::SlowDown(code, _)
+            | Self::BadRedirect(code)
+            | Self::TooLarge(code) => Some(*code),
+        }
+    }
 }
 
 impl std::fmt::Display for FetchFailure {
@@ -500,7 +515,7 @@ impl std::fmt::Display for FetchFailure {
             Self::BadRedirect(code) => {
                 write!(f, "HTTP status {code} without a usable Location")
             }
-            Self::TooLarge => write!(f, "body exceeds {MAX_BODY_BYTES} bytes"),
+            Self::TooLarge(_) => write!(f, "body exceeds {MAX_BODY_BYTES} bytes"),
         }
     }
 }
@@ -512,11 +527,12 @@ async fn fetch_text(client: Client, url: Url, index: usize) -> PageOutcome {
     let outcome = fetch_body(&client, url).await;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     match outcome {
-        Ok(Fetched::Text(text, detected)) => {
+        Ok(Fetched::Text(text, detected, status)) => {
             // `detected_encoding` is present only when the encoding was guessed.
             tracing::debug!(
                 index,
                 elapsed_ms,
+                status,
                 bytes = text.len(),
                 detected_encoding = detected.map(Encoding::name),
                 "page collected"
@@ -537,7 +553,14 @@ async fn fetch_text(client: Client, url: Url, index: usize) -> PageOutcome {
             PageOutcome::SlowDown(pause)
         }
         Err(failure) => {
-            tracing::debug!(index, elapsed_ms, reason = %failure, "page not collected");
+            // `status` is present only when an HTTP answer was received.
+            tracing::debug!(
+                index,
+                elapsed_ms,
+                status = failure.status(),
+                reason = %failure,
+                "page not collected"
+            );
             PageOutcome::Done(None)
         }
     }
@@ -592,7 +615,7 @@ async fn fetch_body(client: &Client, url: Url) -> Result<Fetched, FetchFailure> 
         .content_length()
         .is_some_and(|length| length > MAX_BODY_BYTES as u64)
     {
-        return Err(FetchFailure::TooLarge);
+        return Err(FetchFailure::TooLarge(status.as_u16()));
     }
     // An unknown or missing header charset gives `None`, so `decode_text` falls
     // through to the meta prescan.
@@ -603,17 +626,18 @@ async fn fetch_body(client: &Client, url: Url) -> Result<Fetched, FetchFailure> 
         .and_then(charset_from_content_type);
     let body = read_capped(response).await?;
     let (text, detected) = decode_text(&body, declared, tld.as_deref());
-    Ok(Fetched::Text(text, detected))
+    Ok(Fetched::Text(text, detected, status.as_u16()))
 }
 
 /// Read the body chunk by chunk, refusing rather than buffering past [`MAX_BODY_BYTES`].
 /// The limit is checked against bytes actually read, since `Content-Length` may be
 /// absent or wrong.
 async fn read_capped(mut response: Response) -> Result<Vec<u8>, FetchFailure> {
+    let status = response.status().as_u16();
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(FetchFailure::Transport)? {
         if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
-            return Err(FetchFailure::TooLarge);
+            return Err(FetchFailure::TooLarge(status));
         }
         body.extend_from_slice(&chunk);
     }
