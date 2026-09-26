@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import zlib
 from collections import defaultdict, deque
 from time import perf_counter
 from urllib.parse import urlsplit
@@ -34,38 +35,96 @@ def _host(raw_url: str) -> str:
     return parts.hostname.rstrip(".").encode("idna").decode("ascii").lower()
 
 
+def _decompressor(encoding: str) -> zlib._Decompress | None:
+    """Return a streaming decoder for a supported Content-Encoding, else None.
+
+    Only single gzip or zlib-wrapped deflate codings are decoded, matching the
+    tokens the Rust client decodes except brotli (not in the standard library).
+    """
+    match encoding:
+        case "gzip":
+            return zlib.decompressobj(wbits=31)
+        case "deflate":
+            return zlib.decompressobj(wbits=15)
+        case _:
+            return None
+
+
+async def _read_body(response: aiohttp.ClientResponse) -> tuple[str | None, str]:
+    """Read a response with the size cap applied to decoded bytes.
+
+    Returns the text (or None) and a short outcome label for logging.
+    """
+    if not 200 <= response.status < 300:
+        return None, f"HTTP {response.status}"
+    encoding = response.headers.get("Content-Encoding", "").strip().lower()
+    decoder = None
+    if encoding in {"", "identity"}:
+        # The header only bounds identity bodies; a compressed length says
+        # nothing about the decoded size.
+        if response.content_length is not None and response.content_length > MAX_BODY_BYTES:
+            return None, "body exceeds limit"
+    else:
+        decoder = _decompressor(encoding)
+        if decoder is None:
+            return None, "unsupported encoding"
+    body = bytearray()
+    received = 0
+    try:
+        async for chunk in response.content.iter_chunked(CHUNK_BYTES):
+            received += len(chunk)
+            if decoder is None:
+                if len(body) + len(chunk) > MAX_BODY_BYTES:
+                    return None, "body exceeds limit"
+                body.extend(chunk)
+                continue
+            data = chunk
+            while data:
+                if decoder.eof:
+                    return None, "trailing data after compressed stream"
+                # At most cap + 1 decoded bytes are ever held in memory.
+                body.extend(decoder.decompress(data, MAX_BODY_BYTES - len(body) + 1))
+                if len(body) > MAX_BODY_BYTES:
+                    return None, "body exceeds limit"
+                if decoder.unused_data:
+                    return None, "trailing data after compressed stream"
+                data = decoder.unconsumed_tail
+        if decoder is not None and received:
+            body.extend(decoder.flush())
+            if len(body) > MAX_BODY_BYTES:
+                return None, "body exceeds limit"
+            if not decoder.eof:
+                return None, "truncated compressed stream"
+    except zlib.error:
+        return None, "corrupt compressed stream"
+    try:
+        return body.decode(response.charset or "utf-8", errors="replace"), "collected"
+    except LookupError:
+        return body.decode("utf-8", errors="replace"), "collected"
+
+
 async def _fetch(session: aiohttp.ClientSession, url: str, index: int) -> str | None:
+    started = perf_counter()
+    status: int | None = None
     try:
         # Public research URLs are supplied by the operator. Proxies, authenticated
         # pages, robots handling and an allowlist are out of scope; review the list
         # and site policies before running. This is not a public URL-submission service.
         async with session.get(url, allow_redirects=False) as response:
-            if not 200 <= response.status < 300:
-                LOGGER.debug("Input %d: HTTP %d", index, response.status)
-                return None
-            # simplification: request identity and reject compressed responses; this
-            # bounds memory before decoding. Add bounded streaming decompression if needed.
-            if response.headers.get("Content-Encoding", "identity").lower() != "identity":
-                LOGGER.debug("Input %d: compressed response declined", index)
-                return None
-            if response.content_length is not None and response.content_length > MAX_BODY_BYTES:
-                LOGGER.debug("Input %d: body exceeds limit", index)
-                return None
-            body = bytearray()
-            async for chunk in response.content.iter_chunked(CHUNK_BYTES):
-                if len(body) + len(chunk) > MAX_BODY_BYTES:
-                    LOGGER.debug("Input %d: body exceeds limit", index)
-                    return None
-                body.extend(chunk)
-            try:
-                return body.decode(response.charset or "utf-8", errors="replace")
-            except LookupError:
-                return body.decode("utf-8", errors="replace")
+            status = response.status
+            text, outcome = await _read_body(response)
     except Exception as error:
         # A per-page failure must not escape the batch. Caller cancellation remains
         # cancellable (CancelledError is a BaseException, not an Exception).
-        LOGGER.debug("Input %d: %s", index, type(error).__name__)
-        return None
+        text, outcome = None, type(error).__name__
+    # One final record per page; no URL or body content is logged.
+    LOGGER.debug("Input %d: %s", index, outcome, extra={
+        "page_index": index,
+        "page_status": status,
+        "page_elapsed_ms": (perf_counter() - started) * 1000,
+        "page_outcome": outcome,
+    })
+    return text
 
 
 async def download_texts(
@@ -88,7 +147,14 @@ async def download_texts(
         try:
             groups[_host(url)].append((index, url))
         except Exception as error:
-            LOGGER.debug("Input %d: %s", index, type(error).__name__)
+            # Final record for a rejected input; same shape as _fetch, no URL.
+            outcome = type(error).__name__
+            LOGGER.debug("Input %d: %s", index, outcome, extra={
+                "page_index": index,
+                "page_status": None,
+                "page_elapsed_ms": 0.0,
+                "page_outcome": outcome,
+            })
     if not groups:
         return results
 
@@ -103,7 +169,7 @@ async def download_texts(
         async with aiohttp.ClientSession(
             connector=connector, timeout=REQUEST_TIMEOUT, trust_env=False,
             cookie_jar=aiohttp.DummyCookieJar(), auto_decompress=False,
-            headers={"Accept-Encoding": "identity", "User-Agent": "PublicPageResearch/1.0"},
+            headers={"Accept-Encoding": "gzip, deflate", "User-Agent": "PublicPageResearch/1.0"},
             read_bufsize=CHUNK_BYTES,
         ) as session:
             try:

@@ -67,7 +67,7 @@ results = asyncio.run(download_texts(
 - A round-robin scheduler starts only eligible hosts, creating at most `concurrency` request tasks. A backlog for one host cannot occupy all workers waiting for that host.
 - One session and connector per batch. Connection limits match the request caps; idle connections can be reused for five seconds. The connector limits acquired connections, not the cumulative count of idle sockets across every hostname. Cookies and environment-based proxies are disabled; DNS caching is disabled to avoid a growing per-batch cache.
 - Timeouts: five seconds for connection acquisition, five for socket connection, five between received chunks, and twenty total per started request. Waiting in the scheduler does not consume the request deadline. A batch with many pages can therefore take longer than twenty seconds.
-- Bodies are read in 64 KiB chunks and rejected above 2 MiB. Oversized pages are None, never silently truncated. Declared lengths are checked, but streaming limits also cover missing or inaccurate lengths.
+- Bodies are read in 64 KiB chunks and rejected above 2 MiB of decoded text. Oversized pages are None, never silently truncated. Declared lengths are checked for uncompressed bodies, and the streaming limit also covers missing or inaccurate lengths.
 - Declared text character sets are honored. Missing, unknown or non-text character sets fall back to UTF-8; invalid byte sequences become replacement characters.
 - Only absolute HTTP/HTTPS URLs without whitespace, control characters or user information are accepted. URLs longer than 8192 characters fail without a request.
 - Invalid concurrency or host limits return an all-None list without requests. Per-URL and ordinary batch setup errors do not escape the batch. Caller cancellation deliberately propagates after cleanup, rather than pretending unfinished work succeeded.
@@ -78,7 +78,7 @@ results = asyncio.run(download_texts(
 
 The Python baseline does not follow redirects (the Rust version does): every non-2xx response, including 3xx and 429, becomes None. Supply final public URLs. There are no automatic retries, so failures do not introduce retry delays or extra traffic. Concurrency limits are not a requests-per-second policy or a robots implementation.
 
-For a predictable memory ceiling, requests advertise `Accept-Encoding: identity`, automatic decompression is disabled, and compressed responses are declined. This deliberately favors bounded resource use over covering every public page. Supporting them later requires bounded streaming decompression, not merely turning automatic decompression on.
+Compressed pages: requests advertise `Accept-Encoding: gzip, deflate`. aiohttp's automatic decompression stays off; the downloader decompresses while streaming instead, so the 2 MiB cap applies to decoded bytes, as in the Rust version, and a small compressed page cannot expand without limit (at most cap + 1 decoded bytes are held). Brotli (`br`) is not advertised because it is not in the Python standard library; a page sent with it, or with any other unknown encoding, is None, as are corrupt, truncated or trailing-data compressed bodies. The Rust version also advertises and decodes `br`.
 
 Temporary body storage is bounded per active request, but retained output necessarily grows with successful input count: approximately O(number of pages × body limit), with additional Unicode storage. Scheduling metadata is O(number of inputs); request tasks are O(concurrency). Use smaller batches when collecting large datasets. No constant-memory or cross-language speed claim is made.
 
@@ -88,9 +88,9 @@ Temporary body storage is bounded per active request, but retained output necess
 .venv/Scripts/python -m unittest -v
 ```
 
-Local HTTP tests cover ordering, duplicates, failures, encoding fallback, global and hostname caps across ports, fair scheduling, bounded task counts, connection reuse, oversized/chunked bodies, compression refusal, redirects, read/total timeouts and cancellation cleanup. They use only loopback servers. Real connection-establishment timeout timing is not tested by these local cases.
+Local HTTP tests cover ordering, duplicates, failures, encoding fallback, global and hostname caps across ports, fair scheduling, bounded task counts, connection reuse, oversized/chunked bodies, gzip and deflate decoding (including a page of exactly 2 MiB decoded, a decompression bomb, and corrupt, truncated, trailing-data, empty and brotli bodies), the advertised `Accept-Encoding`, redirects, read/total timeouts and cancellation cleanup. They use only loopback servers. Real connection-establishment timeout timing is not tested by these local cases.
 
-Observed on Windows with Python 3.13.7 and aiohttp 3.14.3: all nine tests passed using `python -W error::ResourceWarning -m unittest -v` (10.285 seconds). The public demo collected two of three pages in 0.192 seconds; python.org sent a compressed response despite the identity request and was correctly returned as None. A diagnostic rerun confirmed that reason. These are single-run observations, not a throughput guarantee. Python 3.11 and Linux/macOS were not exercised here.
+Observed on Windows with Python 3.13.7 and aiohttp 3.14.3: all 12 tests passed using `python -W error::ResourceWarning -m unittest -v`. Python 3.11 and Linux/macOS were not exercised here.
 
 For per-input failure categories, enable standard logging before calling the function:
 
@@ -99,7 +99,7 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 ```
 
-Downloader messages contain input indices and failure categories, not raw URLs or page bodies. The public demo reports aggregate timing and success counts.
+Each page gets one final debug record with its input index and outcome (collected, or the failure category), plus structured `page_index`, `page_status`, `page_elapsed_ms` and `page_outcome` fields for handlers. Records never contain raw URLs or page bodies. The public demo reports aggregate timing and success counts.
 
 ## Evidence and Steroids integration
 

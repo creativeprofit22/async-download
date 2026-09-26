@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import unittest
+import zlib
 from collections import Counter
 from time import perf_counter
 
@@ -17,6 +18,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.handlers: set[asyncio.Task[None]] = set()
         self.requests: list[str] = []
+        self.accept_encodings: list[str] = []
         self.connections = 0
         self.active: Counter[str] = Counter()
         self.peak: Counter[str] = Counter()
@@ -52,6 +54,10 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
                 request = await reader.readuntil(b"\r\n\r\n")
                 path = request.split(b" ", 2)[1].decode("ascii")
                 self.requests.append(path)
+                for line in request.split(b"\r\n")[1:]:
+                    name, _, value = line.partition(b":")
+                    if name.strip().lower() == b"accept-encoding":
+                        self.accept_encodings.append(value.strip().decode("ascii"))
                 self.active[host] += 1
                 self.peak[host] = max(self.peak[host], self.active[host])
                 self.global_peak = max(self.global_peak, sum(self.active.values()))
@@ -84,6 +90,8 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
                     status = b"200 OK"
                     if path == "/fail":
                         status = b"503 Unavailable"
+                    elif path == "/missing":
+                        status = b"404 Not Found"
                     elif path == "/empty":
                         body = b""
                     elif path == "/latin":
@@ -101,6 +109,28 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
                     elif path == "/compressed":
                         body = gzip.compress(b"x" * (MAX_BODY_BYTES + 1))
                         headers = b"Content-Encoding: gzip\r\n"
+                    elif path == "/gzip":
+                        body = gzip.compress(b"gzip page")
+                        headers = b"Content-Encoding: gzip\r\n"
+                    elif path == "/deflate":
+                        body = zlib.compress(b"deflate page")
+                        headers = b"Content-Encoding: deflate\r\n"
+                    elif path == "/gzip-boundary":
+                        body = gzip.compress(b"x" * MAX_BODY_BYTES)
+                        headers = b"Content-Encoding: gzip\r\n"
+                    elif path == "/brotli":
+                        body, headers = b"\x0b\x02\x80hi\x03", b"Content-Encoding: br\r\n"
+                    elif path == "/gzip-corrupt":
+                        body = gzip.compress(b"corrupt page")[:10] + b"\xff" * 20
+                        headers = b"Content-Encoding: gzip\r\n"
+                    elif path == "/gzip-truncated":
+                        body = gzip.compress(b"truncated page " * 100)[:-12]
+                        headers = b"Content-Encoding: gzip\r\n"
+                    elif path == "/gzip-trailing":
+                        body = gzip.compress(b"page") + b"junk"
+                        headers = b"Content-Encoding: gzip\r\n"
+                    elif path == "/gzip-empty":
+                        body, headers = b"", b"Content-Encoding: gzip\r\n"
                     elif path == "/redirect":
                         status, headers = b"302 Found", b"Location: /unexpected\r\n"
                     elif path == "/truncated":
@@ -150,6 +180,60 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[5], "x" * MAX_BODY_BYTES)
         self.assertEqual(results[6], "/ok")
         self.assertNotIn("/unexpected", self.requests)
+
+    async def test_compressed_pages_are_decoded_within_the_cap(self) -> None:
+        cases = [
+            ("/gzip", "gzip page"),
+            ("/deflate", "deflate page"),
+            ("/gzip-boundary", "x" * MAX_BODY_BYTES),
+            ("/compressed", None),
+            ("/brotli", None),
+            ("/gzip-corrupt", None),
+            ("/gzip-truncated", None),
+            ("/gzip-trailing", None),
+            ("/gzip-empty", ""),
+        ]
+        results = await download_texts([self.bases[0] + path for path, _ in cases], 4)
+        for (path, expected), result in zip(cases, results, strict=True):
+            with self.subTest(path=path):
+                self.assertEqual(result, expected)
+        self.assertEqual(set(self.accept_encodings), {"gzip, deflate"})
+
+    async def test_one_structured_record_per_page_without_urls(self) -> None:
+        # bench/py_driver.py consumes page_index and page_status from these records.
+        cases = [("/ok", 200, "collected"), ("/missing", 404, "HTTP 404")]
+        urls = [self.bases[0] + path for path, _, _ in cases]
+        with self.assertLogs("downloader", "DEBUG") as captured:
+            results = await download_texts(urls, 2)
+        self.assertEqual(results, ["/ok", None])
+        for index, (path, status, outcome) in enumerate(cases):
+            with self.subTest(path=path):
+                records = [record for record in captured.records
+                           if getattr(record, "page_index", None) == index]
+                self.assertEqual(len(records), 1)
+                record = records[0]
+                self.assertEqual(getattr(record, "page_status"), status)
+                elapsed = getattr(record, "page_elapsed_ms")
+                self.assertIsInstance(elapsed, float)
+                self.assertGreaterEqual(elapsed, 0.0)
+                self.assertEqual(getattr(record, "page_outcome"), outcome)
+        for record in captured.records:
+            message = record.getMessage()
+            for url in urls:
+                self.assertNotIn(url, message)
+
+    async def test_rejected_input_emits_one_structured_record(self) -> None:
+        with self.assertLogs("downloader", "DEBUG") as captured:
+            results = await download_texts(["not a url"], 1)
+        self.assertEqual(results, [None])
+        records = [record for record in captured.records
+                   if getattr(record, "page_index", None) == 0]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertIsNone(getattr(record, "page_status"))
+        self.assertEqual(getattr(record, "page_elapsed_ms"), 0.0)
+        self.assertEqual(getattr(record, "page_outcome"), "ValueError")
+        self.assertNotIn("not a url", record.getMessage())
 
     async def test_invalid_urls_and_limits_send_nothing(self) -> None:
         urls = ["file:///tmp/page", "ftp://example.com", "", "http://", "http://[",
