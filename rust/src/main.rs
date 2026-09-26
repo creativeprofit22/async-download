@@ -11,10 +11,11 @@ use tracing_subscriber::prelude::*;
 
 use public_page_download::{Limits, download_texts_with_limits};
 
-// Pages chosen because they answer directly; redirects count as failures by design.
+// Public pages for the demo. `https://python.org/` redirects to
+// `https://www.python.org/`, so the run also shows a redirect being followed.
 const DEMO_URLS: [&str; 8] = [
     "https://example.com/",
-    "https://www.python.org/",
+    "https://python.org/",
     "https://www.iana.org/domains/reserved",
     "https://rust-lang.org/",
     "https://en.wikipedia.org/wiki/Web_crawler",

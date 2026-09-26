@@ -12,8 +12,11 @@
 //! - Out of scope, deliberately: proxies (system proxy settings are ignored),
 //!   authenticated pages and cookies, robots.txt handling, and a host allowlist.
 //!   Review the URL list and each site's usage policy before running a batch.
-//! - Redirects are not followed; a redirect response counts as a failed page. This
-//!   keeps every request on the host whose per-host limit was reserved for it.
+//! - Redirects (301, 302, 303, 307, 308) are followed by the dispatcher, not by the
+//!   HTTP client: the target is resolved against the page URL, checked with the
+//!   same rules as an input URL and queued on the target host, so that host's
+//!   limit and pacing apply. At most [`MAX_REDIRECTS`] hops per input; loops,
+//!   a missing or unusable `Location`, and non-http(s) targets give `None`.
 //! - Pacing and slow-down pauses apply per exact hostname. Grouping subdomains
 //!   under one registered domain (eTLD+1) is out of scope, because it needs the
 //!   public suffix list.
@@ -26,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use encoding_rs::{Encoding, UTF_8};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, Response, StatusCode, Url, redirect};
 use tokio::task::{Id, JoinSet};
 
@@ -42,6 +45,9 @@ pub const DEFAULT_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// Longest pause honoured from a `Retry-After` header. A host asking for more is
 /// paused this long, and the page that received the answer is not retried.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Most redirect hops followed for one input. A page that redirects again after
+/// this many hops yields `None`.
+pub const MAX_REDIRECTS: usize = 5;
 /// Global limit used by [`Limits::default`].
 const DEFAULT_MAX_IN_FLIGHT: usize = 8;
 
@@ -104,6 +110,11 @@ pub async fn download_texts<S: AsRef<str>>(urls: &[S], concurrency: usize) -> Ve
 /// paused, for at most [`MAX_RETRY_AFTER`], and the page is retried once after
 /// the pause. A second slow-down answer, or a requested pause above the cap,
 /// leaves that page `None`. Requests already in flight are not cancelled.
+///
+/// A redirect answer puts the page back in the queue of the target host, first
+/// in line, keeping its result slot. Each hop is a new request under the target
+/// host's limit and pacing. After [`MAX_REDIRECTS`] hops, on a loop, or when the
+/// target is not an acceptable input URL, the slot stays `None`.
 pub async fn download_texts_with_limits<S: AsRef<str>>(
     urls: &[S],
     limits: Limits,
@@ -204,10 +215,39 @@ pub async fn download_texts_with_limits<S: AsRef<str>>(
         match outcome {
             PageOutcome::Done(text) => results[page.index] = text,
             PageOutcome::SlowDown(asked) => state.slow_down(page, asked, Instant::now()),
+            PageOutcome::Redirect(location) => {
+                requeue_redirect(&mut hosts, &mut ready, per_host, page, &location);
+            }
         }
-        state.enlist(&host, per_host, &mut ready);
+        if let Some(state) = hosts.get_mut(&host) {
+            state.enlist(&host, per_host, &mut ready);
+        }
     }
     results
+}
+
+/// Queue a redirected page on its target host, or log why the redirect is not
+/// followed (the page's slot then stays `None`). The page joins the target host's
+/// queue, so that host's per-host limit, pacing and any pause apply to it. It goes
+/// first: a started chain finishes before new work.
+fn requeue_redirect(
+    hosts: &mut HashMap<String, HostState>,
+    ready: &mut VecDeque<String>,
+    per_host: usize,
+    page: Pending,
+    location: &str,
+) {
+    let index = page.index;
+    match follow_redirect(page, location) {
+        Ok((target, page)) => {
+            let state = hosts
+                .entry(target.clone())
+                .or_insert_with(|| HostState::new(Instant::now()));
+            state.queue.push_front(page);
+            state.enlist(&target, per_host, ready);
+        }
+        Err(reason) => tracing::debug!(index, reason, "redirect not followed"),
+    }
 }
 
 /// One page waiting to be requested.
@@ -215,8 +255,63 @@ pub async fn download_texts_with_limits<S: AsRef<str>>(
 struct Pending {
     index: usize,
     url: Url,
+    /// Redirect hops already followed for this input.
+    hops: usize,
+    /// URLs already requested for this input, without fragments. Holds at most
+    /// `MAX_REDIRECTS + 1` entries.
+    seen: Vec<Url>,
     /// Whether this page already received a slow-down answer once.
     retried: bool,
+}
+
+impl Pending {
+    fn new(index: usize, url: Url) -> Self {
+        let seen = vec![without_fragment(&url)];
+        Self {
+            index,
+            url,
+            hops: 0,
+            seen,
+            retried: false,
+        }
+    }
+}
+
+fn without_fragment(url: &Url) -> Url {
+    let mut url = url.clone();
+    url.set_fragment(None);
+    url
+}
+
+/// Resolve one redirect for `page` and return the target's host key with the
+/// page moved to the target URL. The target must pass the same checks as an
+/// input URL, must not repeat a URL this input already requested, and the chain
+/// may have at most [`MAX_REDIRECTS`] hops.
+fn follow_redirect(page: Pending, location: &str) -> Result<(String, Pending), &'static str> {
+    if page.hops >= MAX_REDIRECTS {
+        return Err("too many redirects");
+    }
+    let joined = page
+        .url
+        .join(location)
+        .map_err(|_| "Location is not a valid URL")?;
+    let (host, url) = parse_public_url(joined.as_str())?;
+    let target = without_fragment(&url);
+    if page.seen.contains(&target) {
+        return Err("redirect loop");
+    }
+    let mut seen = page.seen;
+    seen.push(target);
+    Ok((
+        host,
+        Pending {
+            index: page.index,
+            url,
+            hops: page.hops + 1,
+            seen,
+            retried: page.retried,
+        },
+    ))
 }
 
 /// Scheduling state of one host.
@@ -231,6 +326,16 @@ struct HostState {
 }
 
 impl HostState {
+    /// An empty, unlisted host that may start a request at `now`.
+    fn new(now: Instant) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            in_flight: 0,
+            next_start: now,
+            listed: false,
+        }
+    }
+
     /// Pause this host after a slow-down answer and requeue the page for one retry.
     /// Only this host is paused; other hosts keep their own schedule.
     fn slow_down(&mut self, page: Pending, asked: Duration, now: Instant) {
@@ -278,18 +383,12 @@ fn group_by_host<S: AsRef<str>>(
                 .or_insert_with_key(|host| {
                     ready.push_back(host.clone());
                     HostState {
-                        queue: VecDeque::new(),
-                        in_flight: 0,
-                        next_start: now,
                         listed: true,
+                        ..HostState::new(now)
                     }
                 })
                 .queue
-                .push_back(Pending {
-                    index,
-                    url,
-                    retried: false,
-                }),
+                .push_back(Pending::new(index, url)),
             Err(reason) => tracing::debug!(index, reason, "input rejected"),
         }
     }
@@ -357,6 +456,16 @@ enum PageOutcome {
     Done(Option<String>),
     /// The host answered 429 or 503 with a usable `Retry-After` of this length (uncapped).
     SlowDown(Duration),
+    /// The host answered with a redirect to this `Location` value (not yet resolved).
+    Redirect(String),
+}
+
+/// A successful answer from one request.
+#[derive(Debug)]
+enum Fetched {
+    Text(String),
+    /// Raw `Location` value of a 301, 302, 303, 307 or 308 answer.
+    Redirect(String),
 }
 
 #[derive(Debug)]
@@ -364,6 +473,8 @@ enum FetchFailure {
     Transport(reqwest::Error),
     Status(u16),
     SlowDown(u16, Duration),
+    /// A redirect status without a usable `Location` header.
+    BadRedirect(u16),
     TooLarge,
 }
 
@@ -377,21 +488,28 @@ impl std::fmt::Display for FetchFailure {
             Self::SlowDown(code, pause) => {
                 write!(f, "HTTP status {code}, retry after {}s", pause.as_secs())
             }
+            Self::BadRedirect(code) => {
+                write!(f, "HTTP status {code} without a usable Location")
+            }
             Self::TooLarge => write!(f, "body exceeds {MAX_BODY_BYTES} bytes"),
         }
     }
 }
 
 /// Fetch one page and reduce every failure to `None`, logging the reason and
-/// elapsed time. A slow-down answer is passed to the dispatcher instead.
+/// elapsed time. Slow-down and redirect answers are passed to the dispatcher instead.
 async fn fetch_text(client: Client, url: Url, index: usize) -> PageOutcome {
     let started = Instant::now();
     let outcome = fetch_body(&client, url).await;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     match outcome {
-        Ok(text) => {
+        Ok(Fetched::Text(text)) => {
             tracing::debug!(index, elapsed_ms, bytes = text.len(), "page collected");
             PageOutcome::Done(Some(text))
+        }
+        Ok(Fetched::Redirect(location)) => {
+            tracing::debug!(index, elapsed_ms, "page redirected");
+            PageOutcome::Redirect(location)
         }
         Err(failure @ FetchFailure::SlowDown(_, pause)) => {
             tracing::debug!(
@@ -409,7 +527,7 @@ async fn fetch_text(client: Client, url: Url, index: usize) -> PageOutcome {
     }
 }
 
-async fn fetch_body(client: &Client, url: Url) -> Result<String, FetchFailure> {
+async fn fetch_body(client: &Client, url: Url) -> Result<Fetched, FetchFailure> {
     let response = client
         .get(url)
         .send()
@@ -429,6 +547,25 @@ async fn fetch_body(client: &Client, url: Url) -> Result<String, FetchFailure> {
             return Err(FetchFailure::SlowDown(status.as_u16(), pause));
         }
     }
+    if matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) {
+        // Every request is a GET, so all five codes are followed the same way.
+        // The body of a redirect answer is not read. Location is decoded as
+        // UTF-8 rather than visible ASCII, so raw non-ASCII paths are accepted;
+        // joining percent-encodes them before the target is checked.
+        return response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+            .map(|location| Fetched::Redirect(location.to_owned()))
+            .ok_or(FetchFailure::BadRedirect(status.as_u16()));
+    }
     if !status.is_success() {
         return Err(FetchFailure::Status(status.as_u16()));
     }
@@ -446,7 +583,7 @@ async fn fetch_body(client: &Client, url: Url) -> Result<String, FetchFailure> {
         .and_then(|value| value.to_str().ok())
         .and_then(charset_from_content_type);
     let body = read_capped(response).await?;
-    Ok(decode_text(&body, declared))
+    Ok(Fetched::Text(decode_text(&body, declared)))
 }
 
 /// Read the body chunk by chunk, refusing rather than buffering past [`MAX_BODY_BYTES`].
@@ -628,6 +765,91 @@ mod tests {
         );
         assert_eq!(decode_text("café".as_bytes(), None), "café");
         assert_eq!(decode_text(b"caf\xe9", None), "caf\u{FFFD}");
+    }
+
+    fn page(raw: &str) -> Pending {
+        Pending::new(3, Url::parse(raw).expect("test URL"))
+    }
+
+    #[test]
+    fn follows_relative_and_absolute_redirects() {
+        let cases = [
+            ("/b?x=1", "example.com", "https://example.com/b?x=1"),
+            ("c", "example.com", "https://example.com/a/c"),
+            (
+                "//Other.example./d",
+                "other.example",
+                "https://other.example./d",
+            ),
+            (
+                "http://other.example:8080/",
+                "other.example",
+                "http://other.example:8080/",
+            ),
+            ("/a/c#part", "example.com", "https://example.com/a/c#part"),
+        ];
+        for (location, host, url) in cases {
+            let (actual_host, next) =
+                follow_redirect(page("https://example.com/a/b"), location).expect(location);
+            assert_eq!(actual_host, host, "{location}");
+            assert_eq!(next.url.as_str(), url, "{location}");
+            assert_eq!((next.index, next.hops, next.seen.len()), (3, 1, 2));
+        }
+    }
+
+    #[test]
+    fn percent_encodes_non_ascii_redirect_targets() {
+        let (host, next) =
+            follow_redirect(page("https://example.com/a"), "/caf\u{e9}").expect("UTF-8 Location");
+        assert_eq!(host, "example.com");
+        assert_eq!(next.url.as_str(), "https://example.com/caf%C3%A9");
+    }
+
+    #[test]
+    fn stops_redirect_loops_including_fragment_only_changes() {
+        let start = page("https://example.com/a#top");
+        assert_eq!(
+            follow_redirect(start, "/a#other").map(|(h, _)| h),
+            Err("redirect loop")
+        );
+        let (_, next) = follow_redirect(page("https://example.com/a"), "/b").expect("first hop");
+        assert_eq!(
+            follow_redirect(next, "https://example.com/a").map(|(h, _)| h),
+            Err("redirect loop")
+        );
+    }
+
+    #[test]
+    fn caps_redirect_hops() {
+        let mut current = page("https://example.com/0");
+        for hop in 1..=MAX_REDIRECTS {
+            current = follow_redirect(current, &format!("/{hop}"))
+                .expect("within the cap")
+                .1;
+        }
+        assert_eq!(current.hops, MAX_REDIRECTS);
+        assert_eq!(
+            follow_redirect(current, "/next").map(|(h, _)| h),
+            Err("too many redirects")
+        );
+    }
+
+    #[test]
+    fn rejects_disallowed_redirect_targets() {
+        let cases = [
+            "ftp://example.com/file",
+            "file:///etc/hosts",
+            "https://user@example.com/",
+            "https://example.com:0/",
+            "http://[::1",
+            "mailto:someone@example.com",
+        ];
+        for location in cases {
+            assert!(
+                follow_redirect(page("https://example.com/a"), location).is_err(),
+                "{location:?} should be rejected"
+            );
+        }
     }
 
     #[test]

@@ -22,7 +22,9 @@ let texts = public_page_download::download_texts(&urls, 8).await; // Vec<Option<
 
 Pacing and slow-down: request starts to one host are at least `min_interval` apart (default 500 ms, so at most 2 starts per second per host; `--min-interval-ms 0` turns pacing off). A host waiting for its next start holds no global slot, so other hosts keep going. When a host answers 429 or 503 with a `Retry-After` header (seconds, or an HTTP date in the standard `Sun, 06 Nov 1994 08:49:37 GMT` form; older date forms are treated as no usable header), only that host is paused, for at most 60 s, and the page is retried once after the pause. A second slow-down answer, or a requested pause over 60 s, leaves that page `None`. 429/503 without a usable `Retry-After` is an ordinary failure. Hosts are grouped by exact hostname; subdomains of one registered domain are not grouped together (that would need the public suffix list).
 
-Other behaviour: global and per-host limits enforced by a dispatcher (never one task per URL); one shared client; connect 5 s, per-read 5 s, total 20 s; bodies refused above 2 MiB after decompression; declared charset used, UTF-8 fallback otherwise; redirects count as failures; proxies, authenticated pages, robots.txt and an allowlist are out of scope.
+Redirects: a 301, 302, 303, 307 or 308 answer is followed by the dispatcher, not by the HTTP client. The `Location` is resolved against the page URL, checked with the same rules as an input URL (http or https, no user name or password, a valid port), and the page is queued on the target host with its original result slot, so the target host's per-host limit and pacing apply to every hop. Each input follows at most 5 hops. A loop, a missing or unusable `Location`, or a target that would not be accepted as input leaves that page `None`.
+
+Other behaviour: global and per-host limits enforced by a dispatcher (never one task per URL); one shared client; connect 5 s, per-read 5 s, total 20 s; bodies refused above 2 MiB after decompression; declared charset used, UTF-8 fallback otherwise; proxies, authenticated pages, robots.txt and an allowlist are out of scope.
 
 ## Python baseline
 
@@ -74,7 +76,7 @@ results = asyncio.run(download_texts(
 
 **This assumes an operator-reviewed list of public research URLs.** Address restrictions and an allowlist are not implemented; do not expose this function as a public URL-submission service. Confirm permission, site policies and applicable research approvals before collecting pages. Robots handling, proxies, authenticated pages, persistence and dataset governance belong outside this small benchmark component.
 
-Redirects are not followed: every non-2xx response, including 3xx and 429, becomes None. Supply final public URLs. There are no automatic retries, so failures do not introduce retry delays or extra traffic. Concurrency limits are not a requests-per-second policy or a robots implementation.
+The Python baseline does not follow redirects (the Rust version does): every non-2xx response, including 3xx and 429, becomes None. Supply final public URLs. There are no automatic retries, so failures do not introduce retry delays or extra traffic. Concurrency limits are not a requests-per-second policy or a robots implementation.
 
 For a predictable memory ceiling, requests advertise `Accept-Encoding: identity`, automatic decompression is disabled, and compressed responses are declined. This deliberately favors bounded resource use over covering every public page. Supporting them later requires bounded streaming decompression, not merely turning automatic decompression on.
 
