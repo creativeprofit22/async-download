@@ -22,7 +22,10 @@
 //!   public suffix list.
 //! - Text is decoded with, in order: a byte-order mark, the `Content-Type`
 //!   charset, a `<meta>` charset in the first 1024 bytes (the WHATWG HTML
-//!   prescan), then UTF-8 with replacement characters.
+//!   prescan), then UTF-8 if the body is valid UTF-8, or mostly UTF-8 (its valid
+//!   non-ASCII characters outnumber its malformed sequences). Otherwise the
+//!   `chardetng` detector guesses a legacy encoding, hinted by the host's
+//!   top-level domain. Malformed sequences become replacement characters.
 //!
 //! Politeness: request starts to one host are at least [`Limits::min_interval`]
 //! apart. A `429` or `503` response with a usable `Retry-After` pauses only that
@@ -31,6 +34,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
+use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252, X_USER_DEFINED};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, Response, StatusCode, Url, redirect};
@@ -466,7 +470,9 @@ enum PageOutcome {
 /// A successful answer from one request.
 #[derive(Debug)]
 enum Fetched {
-    Text(String),
+    /// The decoded body, and the encoding `chardetng` guessed when nothing
+    /// declared one and the body was not UTF-8 (see [`decode_text`]).
+    Text(String, Option<&'static Encoding>),
     /// Raw `Location` value of a 301, 302, 303, 307 or 308 answer.
     Redirect(String),
 }
@@ -506,8 +512,15 @@ async fn fetch_text(client: Client, url: Url, index: usize) -> PageOutcome {
     let outcome = fetch_body(&client, url).await;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     match outcome {
-        Ok(Fetched::Text(text)) => {
-            tracing::debug!(index, elapsed_ms, bytes = text.len(), "page collected");
+        Ok(Fetched::Text(text, detected)) => {
+            // `detected_encoding` is present only when the encoding was guessed.
+            tracing::debug!(
+                index,
+                elapsed_ms,
+                bytes = text.len(),
+                detected_encoding = detected.map(Encoding::name),
+                "page collected"
+            );
             PageOutcome::Done(Some(text))
         }
         Ok(Fetched::Redirect(location)) => {
@@ -531,6 +544,7 @@ async fn fetch_text(client: Client, url: Url, index: usize) -> PageOutcome {
 }
 
 async fn fetch_body(client: &Client, url: Url) -> Result<Fetched, FetchFailure> {
+    let tld = tld_hint(&url).map(str::to_owned);
     let response = client
         .get(url)
         .send()
@@ -588,7 +602,8 @@ async fn fetch_body(client: &Client, url: Url) -> Result<Fetched, FetchFailure> 
         .and_then(|value| value.to_str().ok())
         .and_then(charset_from_content_type);
     let body = read_capped(response).await?;
-    Ok(Fetched::Text(decode_text(&body, declared)))
+    let (text, detected) = decode_text(&body, declared, tld.as_deref());
+    Ok(Fetched::Text(text, detected))
 }
 
 /// Read the body chunk by chunk, refusing rather than buffering past [`MAX_BODY_BYTES`].
@@ -905,14 +920,85 @@ fn extract_charset_from_content(value: &[u8]) -> Option<&[u8]> {
 /// (`encoding_rs` `decode` sniffs it), then the `Content-Type` charset, then a `<meta>` charset
 /// found by [`prescan_meta_charset`], then UTF-8. The prescan runs for every
 /// response without a recognised header charset, including `text/plain`.
-/// Malformed sequences become U+FFFD rather than failing the page. Decoding a
-/// body of at most 2 MiB is brief enough to run on the async worker.
-fn decode_text(body: &[u8], declared: Option<&'static Encoding>) -> String {
-    let encoding = declared
-        .or_else(|| prescan_meta_charset(body))
-        .unwrap_or(UTF_8);
-    let (text, _, _) = encoding.decode(body);
-    text.into_owned()
+///
+/// As a last resort, when nothing declares an encoding and the body is not
+/// valid UTF-8, `chardetng` (Firefox's detector) guesses a legacy encoding,
+/// using `tld` (the host's top-level domain, see [`tld_hint`]) as a hint.
+/// Valid UTF-8, mostly-UTF-8 bodies (see [`mostly_utf8`]) and bodies with a
+/// byte-order mark are never re-decoded, so a UTF-8 page with a stray bad
+/// byte keeps its text with one U+FFFD.
+/// Malformed sequences become U+FFFD rather than failing the page. Decoding
+/// and detecting on a body of at most 2 MiB is brief enough to run on the
+/// async worker.
+///
+/// The second value is the guessed encoding, `Some` only when the detector
+/// ran, so the caller can log it with the page it belongs to.
+fn decode_text(
+    body: &[u8],
+    declared: Option<&'static Encoding>,
+    tld: Option<&str>,
+) -> (String, Option<&'static Encoding>) {
+    if let Some(encoding) = declared.or_else(|| prescan_meta_charset(body)) {
+        return (encoding.decode(body).0.into_owned(), None);
+    }
+    let (text, _, had_errors) = UTF_8.decode(body);
+    if !had_errors || Encoding::for_bom(body).is_some() || mostly_utf8(body) {
+        return (text.into_owned(), None);
+    }
+    let mut detector = EncodingDetector::new(Iso2022JpDetection::Deny);
+    detector.feed(body, true);
+    // UTF-8 has already failed, so the detector is told not to pick it.
+    let guess = detector.guess(tld.map(str::as_bytes), Utf8Detection::Deny);
+    (
+        guess.decode_without_bom_handling(body).0.into_owned(),
+        Some(guess),
+    )
+}
+
+/// Whether a body that is not wholly valid UTF-8 still reads as UTF-8 with a
+/// few stray bytes, so it keeps its UTF-8 text plus U+FFFD instead of being
+/// re-decoded by the detector's guess.
+///
+/// Rule: the valid non-ASCII UTF-8 characters outnumber the malformed
+/// sequences. A truncated sequence at the end counts as one malformed
+/// sequence. Legacy text almost never forms valid multi-byte UTF-8 by chance,
+/// so a legacy body has far more malformed sequences than valid non-ASCII
+/// characters, while a UTF-8 page with one bad byte has the reverse.
+fn mostly_utf8(body: &[u8]) -> bool {
+    let mut valid_non_ascii = 0_usize;
+    let mut malformed = 0_usize;
+    let mut rest = body;
+    loop {
+        let (valid, error) = match std::str::from_utf8(rest) {
+            Ok(valid) => (valid, None),
+            Err(error) => {
+                // `valid_up_to` is always a char boundary, so this cannot fail.
+                let valid = std::str::from_utf8(&rest[..error.valid_up_to()]).unwrap_or_default();
+                (valid, Some(error))
+            }
+        };
+        valid_non_ascii += valid.chars().filter(|c| !c.is_ascii()).count();
+        let Some(error) = error else { break };
+        malformed += 1;
+        match error.error_len() {
+            Some(len) => rest = &rest[error.valid_up_to() + len..],
+            None => break,
+        }
+    }
+    valid_non_ascii > malformed
+}
+
+/// The rightmost label of the URL's domain, as a hint for the encoding
+/// detector. `None` for IP hosts, and for any label that is not lower-case
+/// ASCII letters, digits or `-`, because `chardetng` panics on other input.
+/// `Url` already lower-cases and Punycode-encodes domain hosts.
+fn tld_hint(url: &Url) -> Option<&str> {
+    let label = url.domain()?.trim_end_matches('.').rsplit('.').next()?;
+    let safe = !label.is_empty()
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    safe.then_some(label)
 }
 
 #[cfg(test)]
@@ -976,11 +1062,110 @@ mod tests {
     #[test]
     fn decodes_with_declared_charset_or_utf8_fallback() {
         assert_eq!(
-            decode_text(b"caf\xe9", Some(encoding_rs::WINDOWS_1252)),
-            "café"
+            decode_text(b"caf\xe9", Some(encoding_rs::WINDOWS_1252), None),
+            ("café".to_owned(), None)
         );
-        assert_eq!(decode_text("café".as_bytes(), None), "café");
-        assert_eq!(decode_text(b"caf\xe9", None), "caf\u{FFFD}");
+        assert_eq!(
+            decode_text("café".as_bytes(), None, None),
+            ("café".to_owned(), None)
+        );
+        // Undeclared and not UTF-8: the detector decides and says so.
+        assert_eq!(
+            decode_text(b"caf\xe9", None, None),
+            ("café".to_owned(), Some(encoding_rs::WINDOWS_1252))
+        );
+    }
+
+    #[test]
+    fn detects_undeclared_windows_1252() {
+        let text = "Le café est très bon, près de la rivière à Paris.";
+        let body = encoded("", text, encoding_rs::WINDOWS_1252);
+        assert_eq!(
+            decode_text(&body, None, None),
+            (text.to_owned(), Some(encoding_rs::WINDOWS_1252))
+        );
+    }
+
+    #[test]
+    fn detects_undeclared_shift_jis() {
+        let text = "日本語のウェブページです。東京の天気は晴れ、明日は雨が降るでしょう。";
+        let body = encoded("", text, encoding_rs::SHIFT_JIS);
+        for tld in [None, Some("jp")] {
+            assert_eq!(
+                decode_text(&body, None, tld),
+                (text.to_owned(), Some(encoding_rs::SHIFT_JIS)),
+                "{tld:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_utf8_is_never_re_decoded() {
+        for text in ["café", "日本語のウェブページです。東京の天気は晴れ。"]
+        {
+            for tld in [None, Some("jp")] {
+                assert_eq!(
+                    decode_text(text.as_bytes(), None, tld),
+                    (text.to_owned(), None),
+                    "{tld:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_with_a_stray_byte_keeps_its_text() {
+        for text in [
+            "Le café est très bon, près de la rivière à Paris.",
+            "日本語のウェブページです。東京の天気は晴れ、明日は雨が降るでしょう。",
+        ] {
+            let mut body = text.as_bytes().to_vec();
+            body.push(0xFF);
+            for tld in [None, Some("jp"), Some("fr")] {
+                assert_eq!(
+                    decode_text(&body, None, tld),
+                    (format!("{text}\u{FFFD}"), None),
+                    "{text} {tld:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counts_utf8_evidence() {
+        let cases: [(&[u8], bool); 5] = [
+            ("é\u{FF}".as_bytes(), true),
+            (b"caf\xe9", false),
+            (b"\xc3\xa9\xff\xff", false),
+            (b"\xc3\xa9\xc3\xa9\xe6\x97", true),
+            (b"\xe6\x97", false),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(mostly_utf8(body), expected, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn detector_is_not_used_with_a_bom() {
+        assert_eq!(
+            decode_text(b"\xef\xbb\xbfcaf\xe9", None, None),
+            ("caf\u{FFFD}".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn tld_hint_is_safe() {
+        let cases = [
+            ("https://example.jp/", Some("jp")),
+            ("https://Example.COM./", Some("com")),
+            ("https://例え.テスト/", Some("xn--zckzah")),
+            ("http://127.0.0.1/", None),
+            ("https://[::1]/", None),
+        ];
+        for (raw, expected) in cases {
+            let url = Url::parse(raw).unwrap();
+            assert_eq!(tld_hint(&url), expected, "{raw}");
+        }
     }
 
     /// `head` followed by `text` encoded as `encoding`.
@@ -1007,16 +1192,25 @@ mod tests {
         ];
         for (head, text, encoding) in cases {
             let body = encoded(head, text, encoding);
-            assert_eq!(decode_text(&body, None), format!("{head}{text}"), "{head}");
+            assert_eq!(
+                decode_text(&body, None, None),
+                (format!("{head}{text}"), None),
+                "{head}"
+            );
         }
     }
 
     #[test]
     fn ignores_meta_charset_past_the_first_1024_bytes() {
         let head = format!("<p>{}</p><meta charset=\"shift_jis\">", "a".repeat(1024));
-        let body = encoded(&head, "日本語", encoding_rs::SHIFT_JIS);
+        let text = "日本語のウェブページです。東京の天気は晴れ、明日は雨が降るでしょう。";
+        let body = encoded(&head, text, encoding_rs::SHIFT_JIS);
         assert_eq!(prescan_meta_charset(&body), None);
-        assert!(decode_text(&body, None).contains('\u{FFFD}'));
+        // The late tag is ignored; the detector recognises the text on its own.
+        assert_eq!(
+            decode_text(&body, None, None),
+            (format!("{head}{text}"), Some(encoding_rs::SHIFT_JIS))
+        );
         // A tag cut off by the limit is ignored too.
         let cut = format!("{}<meta charset=\"shift_jis\">", "a".repeat(1010));
         assert_eq!(prescan_meta_charset(cut.as_bytes()), None);
@@ -1026,8 +1220,8 @@ mod tests {
     fn header_charset_wins_over_meta_charset() {
         let body = b"<meta charset=\"shift_jis\">caf\xe9";
         assert_eq!(
-            decode_text(body, Some(encoding_rs::WINDOWS_1252)),
-            "<meta charset=\"shift_jis\">café"
+            decode_text(body, Some(encoding_rs::WINDOWS_1252), None),
+            ("<meta charset=\"shift_jis\">café".to_owned(), None)
         );
     }
 
@@ -1035,8 +1229,8 @@ mod tests {
     fn byte_order_mark_wins_over_meta_charset() {
         let body = "\u{FEFF}<meta charset=\"windows-1252\">café".as_bytes();
         assert_eq!(
-            decode_text(body, None),
-            "<meta charset=\"windows-1252\">café"
+            decode_text(body, None, None),
+            ("<meta charset=\"windows-1252\">café".to_owned(), None)
         );
     }
 

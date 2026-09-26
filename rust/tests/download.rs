@@ -167,6 +167,10 @@ async fn respond(stream: &mut TcpStream, path: &str, hit: usize) {
             "/nocharset" => ok("text/plain", "café".as_bytes()),
             // "日本語" in Shift_JIS, declared only by the page's meta tag.
             "/meta-sjis" => ok("text/html", b"<meta charset=\"Shift_JIS\"><p>\x93\xfa\x96\x7b\x8c\xea</p>"),
+            // Legacy bodies with no charset in the header or a meta tag, so only
+            // the detector can decode them.
+            "/undeclared-1252" => ok("text/html", UNDECLARED_1252),
+            "/undeclared-sjis" => ok("text/html", UNDECLARED_SJIS),
             "/status500" => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
             "/always-429" => b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
             "/long-429" => b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
@@ -286,6 +290,36 @@ async fn oversized_bodies_are_refused_not_truncated() {
     let results = download_texts(&urls, 3).await;
 
     assert_eq!(results, vec![None, None, Some("café".to_owned())]);
+}
+
+/// "Le café est très bon, près de la rivière à Paris." in windows-1252.
+const UNDECLARED_1252: &[u8] = b"Le caf\xe9 est tr\xe8s bon, pr\xe8s de la rivi\xe8re \xe0 Paris.";
+
+/// "今日はとても良い天気なので、私たちは近くの公園までゆっくり散歩しました。"
+/// in `Shift_JIS`.
+const UNDECLARED_SJIS: &[u8] = b"\x8d\xa1\x93\xfa\x82\xcd\x82\xc6\x82\xc4\x82\xe0\x97\xc7\x82\xa2\x93\x56\x8b\x43\x82\xc8\x82\xcc\x82\xc5\x81\x41\x8e\x84\x82\xbd\x82\xbf\x82\xcd\x8b\xdf\x82\xad\x82\xcc\x8c\xf6\x89\x80\x82\xdc\x82\xc5\x82\xe4\x82\xc1\x82\xad\x82\xe8\x8e\x55\x95\xe0\x82\xb5\x82\xdc\x82\xb5\x82\xbd\x81\x42";
+
+#[tokio::test]
+async fn an_undeclared_legacy_body_is_decoded_by_the_detector() {
+    let (port, _) = start_server().await;
+    // IP hosts give the detector no TLD hint, so it relies on the bytes alone.
+    let urls = [
+        format!("http://{HOST_A}:{port}/undeclared-1252"),
+        format!("http://{HOST_A}:{port}/undeclared-sjis"),
+    ];
+
+    let results = download_texts(&urls, 2).await;
+
+    assert_eq!(
+        results,
+        vec![
+            Some("Le café est très bon, près de la rivière à Paris.".to_owned()),
+            Some(
+                "今日はとても良い天気なので、私たちは近くの公園までゆっくり散歩しました。"
+                    .to_owned()
+            ),
+        ]
+    );
 }
 
 #[tokio::test]
