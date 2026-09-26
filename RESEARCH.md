@@ -18,13 +18,13 @@ A second corpus survey found Rust evidence covering every requirement that the f
 | Compressed pages | Streamed decompression, limit applies to decoded bytes | Refused, so those pages are lost | n/a | n/a |
 | Error isolation | Typed per-request failure reduced to `None`; task panics contained | Exceptions reduced to `None` | Explicit returned errors | Not a per-URL collector |
 | Observability | `tracing` events with reason and elapsed time per page | Debug logging | Status metadata | Error types |
-| Code cost | ~870 lines incl. unit tests (library) | ~155 lines | Not built | Not built |
+| Code cost | ~1,220 lines incl. unit tests (library) | ~155 lines | Not built | Not built |
 
 **Measured on this machine, same 8 public URLs, concurrency 8, 2 per host, before per-host pacing was added.** Rust release build: 8/8 pages in 0.30–0.33 s over four runs. Python baseline: 4–5/8 pages, one run in 0.43 s and two runs in about 5.0 s (a stalled read hit the 5 s read timeout). Single-machine observations on the public network, not a controlled benchmark. Rust's advantage here comes mostly from collecting compressed pages rather than refusing them, and from not stalling; raw CPU speed matters little at this scale because the work is network-bound.
 
 Runners-up: Python stays as the baseline (smaller code, but loses compressed pages). Go was not chosen because it is not installed here and the corpus helpers read did not show separate connect/read/total timeouts. JavaScript was not chosen because the reviewed code covers permits and cancellation but no HTTP pool policy.
 
-Per-host pacing now has a corpus reference (crw, below); the per-host in-flight cap and the `Retry-After` handling are still local design. The corpus has nothing on charset fallback when no charset is declared (we use UTF-8 with replacement characters; HTML meta-tag sniffing is not implemented).
+Per-host pacing now has a corpus reference (crw, below); the per-host in-flight cap and the `Retry-After` handling are still local design. Text decoding follows the browser order: a byte-order mark, then the `Content-Type` charset, then a `<meta>` charset found by the WHATWG prescan of the first 1024 bytes, then UTF-8 with replacement characters. Statistical guessing (as chardetng does) is not used.
 
 ### Rust source patterns used
 
@@ -39,6 +39,9 @@ Per-host pacing now has a corpus reference (crw, below); the per-host in-flight 
 - [fastcrw/crw, `crates/crw-core/src/url_safety.rs`, `safe_redirect_policy`](https://github.com/fastcrw/crw/blob/6281dee1cec6d4490bca6b4cc5ff8fec70fd112a/crates/crw-core/src/url_safety.rs#L6) and [0xMassi/webclaw, `crates/webclaw-fetch/src/tls.rs`, `ssrf_safe_redirect_policy`](https://github.com/0xMassi/webclaw/blob/3c32041967c2c5d5124a984b14a29e6845b77be6/crates/webclaw-fetch/src/tls.rs#L597) — both cap the number of redirect hops (crw at 10) and check each target before following it. They follow redirects inside the HTTP client. We keep the client at `redirect::Policy::none()` and apply the same two rules in the dispatcher instead: the target is resolved against the page URL, checked with the input URL rules, and queued on the target host's queue under the original result slot, so the target host's limit and pacing apply. We allow 5 hops and also stop when a URL repeats within one chain.
 - `Retry-After` handling is local design following RFC 9110 section 10.2.3: delay-seconds or IMF-fixdate. A 429 or 503 carrying it pauses only that host, capped at 60 s, and the page is retried once. The obsolete RFC 850 and asctime date forms are not parsed.
 - [Hmbown/Codewhale, `crates/tui/src/tools/web/extract.rs`, `content_type_encoding`](https://github.com/Hmbown/Codewhale/blob/5765d80278f7184d187fa6682ba96b403a006523/crates/tui/src/tools/web/extract.rs#L485) — reading the `charset` parameter from `Content-Type` and mapping it with `Encoding::for_label`.
+- [WHATWG HTML, "prescan a byte stream to determine its encoding"](https://html.spec.whatwg.org/multipage/parsing.html#prescan-a-byte-stream-to-determine-its-encoding) — the rule followed for the meta step: only the first 1024 bytes, case-insensitive tag and attribute names, comments and other tags' attribute values skipped, `content=...charset=...` only with `http-equiv="Content-Type"`, UTF-16 labels read as UTF-8 and `x-user-defined` as windows-1252. Implemented locally as `prescan_meta_charset`, with labels mapped by `Encoding::for_label`; no dependency added.
+- [spider-rs/auto-encoder, `src/detect.rs`, `detect_encoding`](https://github.com/spider-rs/auto-encoder) (0.2.4, installed source read) — a 1024-byte meta search seen in the ecosystem. It matches case-sensitively and does not skip comments, so it was not used.
+- [spider-rs/spider, `spider/src/utils/robots_cache.rs`, test `preserves_response_charset_decoding`](https://github.com/spider-rs/spider/blob/2e39b2db3eff15c3aaa90e3edcd1d7ba30a5bb2a/spider/src/utils/robots_cache.rs#L447-L496) — a local-server charset test; the model for our loopback meta-charset test.
 
 Crate versions were checked against crates.io (`cargo search` / `cargo info`) and pinned exactly in `rust/Cargo.toml`.
 

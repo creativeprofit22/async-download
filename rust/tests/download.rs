@@ -165,6 +165,8 @@ async fn respond(stream: &mut TcpStream, path: &str, hit: usize) {
         match path {
             "/latin1" => ok("text/plain; charset=ISO-8859-1", b"caf\xe9"),
             "/nocharset" => ok("text/plain", "café".as_bytes()),
+            // "日本語" in Shift_JIS, declared only by the page's meta tag.
+            "/meta-sjis" => ok("text/html", b"<meta charset=\"Shift_JIS\"><p>\x93\xfa\x96\x7b\x8c\xea</p>"),
             "/status500" => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
             "/always-429" => b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
             "/long-429" => b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
@@ -284,6 +286,19 @@ async fn oversized_bodies_are_refused_not_truncated() {
     let results = download_texts(&urls, 3).await;
 
     assert_eq!(results, vec![None, None, Some("café".to_owned())]);
+}
+
+#[tokio::test]
+async fn a_meta_charset_is_used_when_the_header_has_none() {
+    let (port, _) = start_server().await;
+    let urls = [format!("http://{HOST_A}:{port}/meta-sjis")];
+
+    let results = download_texts(&urls, 1).await;
+
+    assert_eq!(
+        results,
+        vec![Some("<meta charset=\"Shift_JIS\"><p>日本語</p>".to_owned())]
+    );
 }
 
 #[tokio::test]

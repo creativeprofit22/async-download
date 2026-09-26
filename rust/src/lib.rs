@@ -20,6 +20,9 @@
 //! - Pacing and slow-down pauses apply per exact hostname. Grouping subdomains
 //!   under one registered domain (eTLD+1) is out of scope, because it needs the
 //!   public suffix list.
+//! - Text is decoded with, in order: a byte-order mark, the `Content-Type`
+//!   charset, a `<meta>` charset in the first 1024 bytes (the WHATWG HTML
+//!   prescan), then UTF-8 with replacement characters.
 //!
 //! Politeness: request starts to one host are at least [`Limits::min_interval`]
 //! apart. A `429` or `503` response with a usable `Retry-After` pauses only that
@@ -28,7 +31,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
-use encoding_rs::{Encoding, UTF_8};
+use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252, X_USER_DEFINED};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, Response, StatusCode, Url, redirect};
 use tokio::task::{Id, JoinSet};
@@ -577,6 +580,8 @@ async fn fetch_body(client: &Client, url: Url) -> Result<Fetched, FetchFailure> 
     {
         return Err(FetchFailure::TooLarge);
     }
+    // An unknown or missing header charset gives `None`, so `decode_text` falls
+    // through to the meta prescan.
     let declared = response
         .headers()
         .get(CONTENT_TYPE)
@@ -690,12 +695,223 @@ fn charset_from_content_type(content_type: &str) -> Option<&'static Encoding> {
     })
 }
 
-/// Decode with the declared charset, falling back to UTF-8 when none is declared
-/// or the label is unknown. A byte-order mark, when present, takes precedence (as
-/// browsers do). Malformed sequences become U+FFFD rather than failing the page.
-/// Decoding a body of at most 2 MiB is brief enough to run on the async worker.
+/// How far into the body the meta prescan looks, as the WHATWG HTML standard sets.
+const PRESCAN_LIMIT: usize = 1024;
+
+/// ASCII whitespace as the HTML standard defines it (tab, LF, FF, CR, space).
+fn is_html_space(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | 0x0C | b'\r' | b' ')
+}
+
+/// Index of the first `needle` in `bytes` at or after `from`.
+fn find_from(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    bytes
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|found| found + from)
+}
+
+/// Find a `<meta>` charset declaration in the first [`PRESCAN_LIMIT`] bytes,
+/// following the WHATWG HTML "prescan a byte stream to determine its encoding"
+/// algorithm: tag and attribute names match case-insensitively, comments and
+/// other tags' attribute values are skipped, and a tag cut off by the limit is
+/// ignored. UTF-16 labels give UTF-8 and `x-user-defined` gives windows-1252,
+/// as the standard says. Unknown labels are ignored.
+fn prescan_meta_charset(body: &[u8]) -> Option<&'static Encoding> {
+    let bytes = &body[..body.len().min(PRESCAN_LIMIT)];
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let rest = &bytes[pos..];
+        if rest.starts_with(b"<!--") {
+            // Searching from the second dash lets `<!-->` close itself, as in the standard.
+            pos = find_from(bytes, pos + 2, b"-->")? + 3;
+            continue;
+        }
+        if rest.len() > 5
+            && rest[..5].eq_ignore_ascii_case(b"<meta")
+            && (is_html_space(rest[5]) || rest[5] == b'/')
+        {
+            pos += 6;
+            if let Some(encoding) = meta_charset(bytes, &mut pos) {
+                return Some(encoding);
+            }
+        } else if rest.len() > 1 && rest[0] == b'<' {
+            let name_start = if rest[1] == b'/' { 2 } else { 1 };
+            if rest.get(name_start).is_some_and(u8::is_ascii_alphabetic) {
+                // Any other tag: skip its attributes so text inside their values
+                // cannot be mistaken for a meta tag.
+                pos += name_start;
+                while bytes
+                    .get(pos)
+                    .is_some_and(|&byte| !is_html_space(byte) && byte != b'>')
+                {
+                    pos += 1;
+                }
+                while get_attribute(bytes, &mut pos).is_some() {}
+            } else if matches!(rest[1], b'!' | b'/' | b'?') {
+                pos = find_from(bytes, pos + 1, b">")?;
+            }
+        }
+        pos += 1;
+    }
+    None
+}
+
+/// Read the attributes of one `<meta>` tag, starting after `<meta` and the byte
+/// that follows it, and return the declared encoding if the tag is a valid
+/// declaration. `pos` is left at the tag's `>` (or at the end of the input).
+fn meta_charset(bytes: &[u8], pos: &mut usize) -> Option<&'static Encoding> {
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut got_pragma = false;
+    // `None` until a charset attribute or a content charset is seen (the
+    // standard's "need pragma is null").
+    let mut need_pragma: Option<bool> = None;
+    let mut charset: Option<&'static Encoding> = None;
+    while let Some((name, value)) = get_attribute(bytes, pos) {
+        // Only the first attribute with a given name counts.
+        if seen.contains(&name) {
+            continue;
+        }
+        match name.as_slice() {
+            b"http-equiv" => got_pragma |= value == b"content-type",
+            b"content" if charset.is_none() => {
+                if let Some(encoding) =
+                    extract_charset_from_content(&value).and_then(Encoding::for_label)
+                {
+                    charset = Some(encoding);
+                    need_pragma = Some(true);
+                }
+            }
+            b"charset" => {
+                charset = Encoding::for_label(&value);
+                need_pragma = Some(false);
+            }
+            _ => {}
+        }
+        seen.push(name);
+    }
+    if *pos >= bytes.len() {
+        // The tag was cut off by the end of the input or the prescan limit.
+        return None;
+    }
+    if need_pragma? && !got_pragma {
+        return None;
+    }
+    let encoding = charset?;
+    Some(if encoding == UTF_16LE || encoding == UTF_16BE {
+        UTF_8
+    } else if encoding == X_USER_DEFINED {
+        WINDOWS_1252
+    } else {
+        encoding
+    })
+}
+
+/// The standard's "get an attribute": read one attribute at `pos`, with the name
+/// and value lowercased. Returns `None` at the tag's `>` (leaving `pos` there) or
+/// when the input ends first (leaving `pos` at the end).
+fn get_attribute(bytes: &[u8], pos: &mut usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    let at = |index: usize| bytes.get(index).copied();
+    while at(*pos).is_some_and(|byte| is_html_space(byte) || byte == b'/') {
+        *pos += 1;
+    }
+    if at(*pos)? == b'>' {
+        return None;
+    }
+    let mut name = Vec::new();
+    loop {
+        match at(*pos)? {
+            b'=' if !name.is_empty() => break,
+            byte if is_html_space(byte) => {
+                while at(*pos).is_some_and(is_html_space) {
+                    *pos += 1;
+                }
+                if at(*pos)? != b'=' {
+                    return Some((name, Vec::new()));
+                }
+                break;
+            }
+            b'/' | b'>' => return Some((name, Vec::new())),
+            byte => name.push(byte.to_ascii_lowercase()),
+        }
+        *pos += 1;
+    }
+    // `pos` is at the `=`.
+    *pos += 1;
+    while at(*pos).is_some_and(is_html_space) {
+        *pos += 1;
+    }
+    let mut value = Vec::new();
+    match at(*pos)? {
+        quote @ (b'"' | b'\'') => loop {
+            *pos += 1;
+            let byte = at(*pos)?;
+            if byte == quote {
+                *pos += 1;
+                return Some((name, value));
+            }
+            value.push(byte.to_ascii_lowercase());
+        },
+        b'>' => return Some((name, value)),
+        _ => {}
+    }
+    loop {
+        let byte = at(*pos)?;
+        if is_html_space(byte) || byte == b'>' {
+            return Some((name, value));
+        }
+        value.push(byte.to_ascii_lowercase());
+        *pos += 1;
+    }
+}
+
+/// The standard's "extract a character encoding from a meta element": the label
+/// after `charset=` in a `content` value, quoted or up to whitespace or `;`.
+fn extract_charset_from_content(value: &[u8]) -> Option<&[u8]> {
+    let skip_spaces = |mut index: usize| {
+        while value.get(index).copied().is_some_and(is_html_space) {
+            index += 1;
+        }
+        index
+    };
+    let mut pos = 0;
+    loop {
+        let found = value
+            .get(pos..)?
+            .windows(7)
+            .position(|window| window.eq_ignore_ascii_case(b"charset"))?;
+        pos = skip_spaces(pos + found + 7);
+        if value.get(pos) != Some(&b'=') {
+            continue;
+        }
+        pos = skip_spaces(pos + 1);
+        let first = *value.get(pos)?;
+        if first == b'"' || first == b'\'' {
+            let rest = &value[pos + 1..];
+            let end = rest.iter().position(|&byte| byte == first)?;
+            return Some(&rest[..end]);
+        }
+        let rest = &value[pos..];
+        let end = rest
+            .iter()
+            .position(|&byte| is_html_space(byte) || byte == b';')
+            .unwrap_or(rest.len());
+        return Some(&rest[..end]);
+    }
+}
+
+/// Decode a body in the order browsers use: a byte-order mark wins
+/// (`encoding_rs` `decode` sniffs it), then the `Content-Type` charset, then a `<meta>` charset
+/// found by [`prescan_meta_charset`], then UTF-8. The prescan runs for every
+/// response without a recognised header charset, including `text/plain`.
+/// Malformed sequences become U+FFFD rather than failing the page. Decoding a
+/// body of at most 2 MiB is brief enough to run on the async worker.
 fn decode_text(body: &[u8], declared: Option<&'static Encoding>) -> String {
-    let (text, _, _) = declared.unwrap_or(UTF_8).decode(body);
+    let encoding = declared
+        .or_else(|| prescan_meta_charset(body))
+        .unwrap_or(UTF_8);
+    let (text, _, _) = encoding.decode(body);
     text.into_owned()
 }
 
@@ -765,6 +981,125 @@ mod tests {
         );
         assert_eq!(decode_text("café".as_bytes(), None), "café");
         assert_eq!(decode_text(b"caf\xe9", None), "caf\u{FFFD}");
+    }
+
+    /// `head` followed by `text` encoded as `encoding`.
+    fn encoded(head: &str, text: &str, encoding: &'static Encoding) -> Vec<u8> {
+        let mut body = head.as_bytes().to_vec();
+        body.extend_from_slice(&encoding.encode(text).0);
+        body
+    }
+
+    #[test]
+    fn decodes_with_meta_charset_when_header_has_none() {
+        let cases = [
+            (
+                "<meta charset=\"Shift_JIS\">",
+                "日本語のページ",
+                encoding_rs::SHIFT_JIS,
+            ),
+            (
+                "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=windows-1251\">",
+                "Привет, мир",
+                encoding_rs::WINDOWS_1251,
+            ),
+            ("<META CHARSET=SHIFT_JIS>", "日本語", encoding_rs::SHIFT_JIS),
+        ];
+        for (head, text, encoding) in cases {
+            let body = encoded(head, text, encoding);
+            assert_eq!(decode_text(&body, None), format!("{head}{text}"), "{head}");
+        }
+    }
+
+    #[test]
+    fn ignores_meta_charset_past_the_first_1024_bytes() {
+        let head = format!("<p>{}</p><meta charset=\"shift_jis\">", "a".repeat(1024));
+        let body = encoded(&head, "日本語", encoding_rs::SHIFT_JIS);
+        assert_eq!(prescan_meta_charset(&body), None);
+        assert!(decode_text(&body, None).contains('\u{FFFD}'));
+        // A tag cut off by the limit is ignored too.
+        let cut = format!("{}<meta charset=\"shift_jis\">", "a".repeat(1010));
+        assert_eq!(prescan_meta_charset(cut.as_bytes()), None);
+    }
+
+    #[test]
+    fn header_charset_wins_over_meta_charset() {
+        let body = b"<meta charset=\"shift_jis\">caf\xe9";
+        assert_eq!(
+            decode_text(body, Some(encoding_rs::WINDOWS_1252)),
+            "<meta charset=\"shift_jis\">café"
+        );
+    }
+
+    #[test]
+    fn byte_order_mark_wins_over_meta_charset() {
+        let body = "\u{FEFF}<meta charset=\"windows-1252\">café".as_bytes();
+        assert_eq!(
+            decode_text(body, None),
+            "<meta charset=\"windows-1252\">café"
+        );
+    }
+
+    #[test]
+    fn prescan_follows_the_whatwg_rules() {
+        use encoding_rs::{SHIFT_JIS, WINDOWS_1251};
+        let cases: [(&str, Option<&'static Encoding>); 17] = [
+            ("<meta charset=\"shift_jis\">", Some(SHIFT_JIS)),
+            ("<meta charset='shift_jis'/>", Some(SHIFT_JIS)),
+            ("<meta/charset=shift_jis>", Some(SHIFT_JIS)),
+            ("<!-- <meta charset=\"shift_jis\"> -->", None),
+            ("<!--> <meta charset=\"shift_jis\">", Some(SHIFT_JIS)),
+            // `content` needs `http-equiv="Content-Type"`.
+            ("<meta content=\"text/html; charset=windows-1251\">", None),
+            (
+                "<meta content='text/html;charset = \"windows-1251\"' http-equiv=content-type>",
+                Some(WINDOWS_1251),
+            ),
+            ("<meta charset=\"utf-16le\">", Some(UTF_8)),
+            ("<meta charset=\"UTF-16\">", Some(UTF_8)),
+            ("<meta charset=\"x-user-defined\">", Some(WINDOWS_1252)),
+            ("<meta charset=\"not-a-charset\">", None),
+            ("<div title='<meta charset=shift_jis>'>", None),
+            (
+                "<meta charset=\"shift_jis\" charset=\"windows-1251\">",
+                Some(SHIFT_JIS),
+            ),
+            ("<metadata charset=\"shift_jis\">", None),
+            ("<meta charset=\"shift_jis", None),
+            ("<meta name=x><p>text</p>", None),
+            // An unknown charset leaves room for a later content declaration.
+            (
+                "<meta charset=bogus http-equiv=content-type content='charset=windows-1251'>",
+                Some(WINDOWS_1251),
+            ),
+        ];
+        for (html, expected) in cases {
+            assert_eq!(prescan_meta_charset(html.as_bytes()), expected, "{html}");
+        }
+    }
+
+    #[test]
+    fn prescan_never_panics_on_truncated_input() {
+        let html = b"<!doctype html><!-- c --><html lang='ja'><meta http-equiv=\"content-type\" content=\"text/html; charset='shift_jis'\"><?pi?></p>";
+        for end in 0..=html.len() {
+            let _ = prescan_meta_charset(&html[..end]);
+        }
+        assert_eq!(prescan_meta_charset(html), Some(encoding_rs::SHIFT_JIS));
+    }
+
+    #[test]
+    fn extracts_charset_from_content_values() {
+        let cases: [(&[u8], Option<&[u8]>); 6] = [
+            (b"text/html; charset=koi8-r", Some(b"koi8-r")),
+            (b"text/html; CHARSET = 'koi8-r' ; x", Some(b"koi8-r")),
+            (b"charsetx; charset=big5;", Some(b"big5")),
+            (b"text/html; charset=\"koi8-r", None),
+            (b"text/html; charset=", None),
+            (b"text/html", None),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(extract_charset_from_content(value), expected);
+        }
     }
 
     fn page(raw: &str) -> Pending {
