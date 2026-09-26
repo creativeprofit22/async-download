@@ -9,8 +9,8 @@ Rust (run from repo root):
 ```bash
 cargo build --locked --manifest-path rust/Cargo.toml
 cargo test --locked --manifest-path rust/Cargo.toml
-cargo clippy --manifest-path rust/Cargo.toml   # lint
-cargo fmt --manifest-path rust/Cargo.toml      # format
+cargo clippy --locked --all-targets --manifest-path rust/Cargo.toml -- -D warnings -W clippy::pedantic   # lint
+cargo fmt --manifest-path rust/Cargo.toml   # format (CI runs with `-- --check`)
 ```
 
 Python (3.11+; use `.venv/Scripts/python` on Windows):

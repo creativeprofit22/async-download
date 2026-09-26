@@ -22,7 +22,7 @@ jobs:
 
       # Rust (primary implementation, rust/)
       - name: Install minimal stable Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
@@ -30,6 +30,10 @@ jobs:
         run: cargo build --locked --manifest-path rust/Cargo.toml
       - name: Test (Rust)
         run: cargo test --locked --manifest-path rust/Cargo.toml
+      - name: Lint (Rust)
+        run: cargo clippy --locked --all-targets --manifest-path rust/Cargo.toml -- -D warnings -W clippy::pedantic
+      - name: Format (Rust)
+        run: cargo fmt --manifest-path rust/Cargo.toml -- --check
 
       # Python baseline (requirements.txt only, no pyproject.toml, so `uv sync` does not apply)
       - uses: astral-sh/setup-uv@v10.2.0
