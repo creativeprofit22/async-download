@@ -20,7 +20,29 @@ A second corpus survey found Rust evidence covering every requirement that the f
 | Observability | `tracing` events with reason and elapsed time per page | Debug logging | Status metadata | Error types |
 | Code cost | ~1,450 lines incl. unit tests (library) | ~215 lines | Not built | Not built |
 
-**Measured on this machine, same 8 public URLs, concurrency 8, 2 per host, before per-host pacing was added.** Rust release build: 8/8 pages in 0.30–0.33 s over four runs. Python baseline: 4–5/8 pages, one run in 0.43 s and two runs in about 5.0 s (a stalled read hit the 5 s read timeout). Single-machine observations on the public network, not a controlled benchmark. Rust's advantage here comes mostly from collecting compressed pages rather than refusing them, and from not stalling; raw CPU speed matters little at this scale because the work is network-bound.
+**Single-machine measurements (September 2026).** Windows 10 (10.0.19045), Intel Core (Family 6 Model 158), Python 3.13.7, aiohttp 3.14.3, rustc 1.97.1, Rust release build. These replace earlier single-run public timings, which were taken while the Python version still refused compressed pages. Both versions now decode gzip and deflate with the 2 MiB limit on decoded bytes. Commands and method are in the README ("Benchmark"); all settings were fixed in `bench/settings.py` before running (seed 20260926, 10 000 bootstrap resamples, 95 % percentile interval).
+
+*Local server* (84 URLs on 4 loopback hosts: delays 10/50/150 ms, sizes 4/64/512 KiB, half gzip, plus a 404, a challenge page and a decompression bomb per host; concurrency 8, 2 per host, Rust pacing off; 1 warm-up and 20 measured runs each, alternating order):
+
+| | Rust | Python |
+| --- | --- | --- |
+| Outcomes per 1 680 pages (ok / blocked / error / mismatch) | 1 440 / 80 / 160 / 0 | 1 440 / 80 / 160 / 0 |
+| Gzip responses received | 720 | 720 |
+| Median per-page completion time (ok pages) | 182.4 ms | 202.8 ms |
+| Median batch wall time | 729.6 ms | 792.1 ms |
+| Median throughput | 115.13 URLs/s | 106.05 URLs/s |
+
+- Median of paired per-URL differences (Python − Rust, 1 440 pairs where both sides were ok; 240 excluded): **+22.3 ms, 95 % CI +21.5 to +23.4**. Pairs within one run are not independent, so this interval understates run-to-run variation.
+- Paired per-run wall-time difference (Python − Rust, 20 runs): **+66.9 ms, 95 % CI +52.4 to +74.3**, about 8 % in Rust's favour. This is the conservative figure.
+- Both versions returned the same outcome for every URL: challenge pages were flagged as blocked (not counted as successes), 404s and decompression bombs were refused.
+- The workload is dominated by server delays; the gap reflects client overhead (decoding, scheduling, connection handling) on one machine, not a general speed ratio.
+
+*Public pages* (7 pages, one per host: example.com, python.org, iana.org, en.wikipedia.org, gnu.org, w3.org, rust-lang.org; 3 runs each, alternating order, 10 s between runs, Rust pacing 500 ms): Rust collected 21/21 pages, Python 18/21. Wikipedia answered Python with 403 on all three runs and Rust with 200, although both send the same User-Agent; the cause was not investigated. Over the 18 pairs where both succeeded, the median per-URL difference (Python − Rust) was −68.9 ms (95 % CI −75.1 to −26.6), and the per-run wall-time difference −11.8 ms (95 % CI −89.3 to +20.7), i.e. no clear difference. Rust also advertises brotli, so some servers send it different bytes. Three runs over the public network are a sanity check, not a controlled comparison.
+
+### Benchmark method sources
+
+- [0xMassi/webclaw, `crates/webclaw-fetch/examples/latency_bench.rs`, lines 120–240](https://github.com/0xMassi/webclaw/blob/3c32041967c2c5d5124a984b14a29e6845b77be6/crates/webclaw-fetch/examples/latency_bench.rs#L120-L240) — one row per URL (status, time, bytes, error) and latency summarised only over successful responses, because fast failures would otherwise look like wins. We add challenge-page detection so a 200 block page is not a success.
+- [fastcrw/crw, `bench/stats.py`, lines 1–160](https://github.com/fastcrw/crw/blob/6281dee1cec6d4490bca6b4cc5ff8fec70fd112a/bench/stats.py#L1-L160) — the median of paired per-item differences with a percentile bootstrap interval, seed and resample count fixed in advance, successes reported separately. crw uses numpy; `bench/stats.py` reimplements the same method with `random` and `statistics`.
 
 Runners-up: Python stays as the baseline (smaller code; no redirects, pacing or brotli). Go was not chosen because it is not installed here and the corpus helpers read did not show separate connect/read/total timeouts. JavaScript was not chosen because the reviewed code covers permits and cancellation but no HTTP pool policy.
 

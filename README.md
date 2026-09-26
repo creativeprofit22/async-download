@@ -90,7 +90,7 @@ Temporary body storage is bounded per active request, but retained output necess
 
 Local HTTP tests cover ordering, duplicates, failures, encoding fallback, global and hostname caps across ports, fair scheduling, bounded task counts, connection reuse, oversized/chunked bodies, gzip and deflate decoding (including a page of exactly 2 MiB decoded, a decompression bomb, and corrupt, truncated, trailing-data, empty and brotli bodies), the advertised `Accept-Encoding`, redirects, read/total timeouts and cancellation cleanup. They use only loopback servers. Real connection-establishment timeout timing is not tested by these local cases.
 
-Observed on Windows with Python 3.13.7 and aiohttp 3.14.3: all 12 tests passed using `python -W error::ResourceWarning -m unittest -v`. Python 3.11 and Linux/macOS were not exercised here.
+`test_bench.py` checks the benchmark harness (statistics, outcome classification, workload shape) without a server or network. Observed on Windows with Python 3.13.7 and aiohttp 3.14.3: all 21 tests passed using `python -W error::ResourceWarning -m unittest -v`. Python 3.11 and Linux/macOS were not exercised here.
 
 For per-input failure categories, enable standard logging before calling the function:
 
@@ -100,6 +100,31 @@ logging.basicConfig(level=logging.DEBUG)
 ```
 
 Each page gets one final debug record with its input index and outcome (collected, or the failure category), plus structured `page_index`, `page_status`, `page_elapsed_ms` and `page_outcome` fields for handlers. Records never contain raw URLs or page bodies. The public demo reports aggregate timing and success counts.
+
+## Benchmark: Rust vs Python
+
+The harness in `bench/` runs both implementations on the same URL list with the same limits and writes one row per URL per run. The statistics and the local test server use only the Python standard library (no numpy). The harness itself runs in the project's virtual environment (`pip install -r requirements.txt`), because the Python driver uses aiohttp. From this directory, build the Rust driver once, then run the local benchmark:
+
+```bash
+cargo build --release --locked --manifest-path rust/Cargo.toml --example bench_driver
+.venv/Scripts/python -m bench local
+.venv/Scripts/python -m bench public   # optional, small and paced
+```
+
+PowerShell:
+
+```powershell
+cargo build --release --locked --manifest-path rust/Cargo.toml --example bench_driver
+.venv\Scripts\python.exe -m bench local
+.venv\Scripts\python.exe -m bench public   # optional, small and paced
+```
+
+On Linux/macOS use `.venv/bin/python`. The local server listens on 127.0.0.1 to 127.0.0.4; Linux and Windows route these by default, macOS needs loopback aliases (`sudo ifconfig lo0 alias 127.0.0.2 up`, and the same for .3 and .4).
+
+- **local**: a loopback server with 4 hosts, each serving 18 pages (delays 10/50/150 ms × sizes 4/64/512 KiB × plain/gzip), a 404, a 200 challenge page and a gzip page that decodes past 2 MiB: 84 URLs. One warm-up run and 20 measured runs per implementation, order alternating each run, concurrency 8, 2 per host, Rust pacing off (the Python version has no pacing).
+- **public**: 7 public pages, one per host, 3 runs per implementation, order alternating, 10 s between runs, Rust pacing 500 ms. Use final URLs; the Python version does not follow redirects.
+
+Each run is one driver process (`rust/examples/bench_driver.rs` or `bench/py_driver.py`), timed inside the process from just before the batch call. All settings (runs, seed `20260926`, 10 000 bootstrap resamples, 95 % confidence) are fixed in `bench/settings.py`. Results go to `bench/results/local.csv` (columns `run, position, implementation, url, status, elapsed_ms, bytes, outcome`) and a Markdown summary in `bench/results/local.md` (likewise `public.*`). Outcomes are `ok`, `blocked` (a challenge page), `error` or `mismatch` (wrong size, or a page that should have failed); only `ok` counts as a success. The summary reports success counts per implementation, the median of paired per-URL differences (Python − Rust, only pairs where both sides are `ok`) with a bootstrap 95 % interval, and the per-run wall-time difference with its interval. See [RESEARCH.md](RESEARCH.md) for the recorded results.
 
 ## Evidence and Steroids integration
 

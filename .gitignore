@@ -9,3 +9,4 @@ __pycache__/
 opensrc/
 rust/target/
 .gg/
+bench/results/
