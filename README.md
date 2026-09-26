@@ -7,7 +7,7 @@ Asynchronous bulk URL collection for NGO-backed public-safety infrastructure and
 See [RESEARCH.md](RESEARCH.md) for why Rust replaced Python as the primary version. Requires a Rust toolchain (1.85+). Exact demo command, from this directory:
 
 ```bash
-cargo run --release --manifest-path rust/Cargo.toml -- --concurrency 8 --per-host 2
+cargo run --release --manifest-path rust/Cargo.toml -- --concurrency 8 --per-host 2 --min-interval-ms 500
 ```
 
 It fetches eight public pages and prints each page's character count (or `None`), then total time and URLs per second. It never prints page contents. Add `--verbose` for per-page reasons and elapsed times on stderr, or pass your own URLs as extra arguments.
@@ -18,9 +18,11 @@ Library use:
 let texts = public_page_download::download_texts(&urls, 8).await; // Vec<Option<String>>, same order as urls
 ```
 
-`download_texts_with_limits(&urls, Limits { max_in_flight, per_host })` sets both limits explicitly. Tests use a local server and need no network: `cargo test --manifest-path rust/Cargo.toml`.
+`download_texts_with_limits(&urls, Limits { max_in_flight, per_host, min_interval })` sets the limits explicitly; `Limits::default()` is 8 in flight, 2 per host, 500 ms between starts. Tests use a local server and need no network: `cargo test --manifest-path rust/Cargo.toml`.
 
-Behaviour: global and per-host limits enforced by a dispatcher (never one task per URL); one shared client; connect 5 s, per-read 5 s, total 20 s; bodies refused above 2 MiB after decompression; declared charset used, UTF-8 fallback otherwise; redirects count as failures; proxies, authenticated pages, robots.txt and an allowlist are out of scope.
+Pacing and slow-down: request starts to one host are at least `min_interval` apart (default 500 ms, so at most 2 starts per second per host; `--min-interval-ms 0` turns pacing off). A host waiting for its next start holds no global slot, so other hosts keep going. When a host answers 429 or 503 with a `Retry-After` header (seconds, or an HTTP date in the standard `Sun, 06 Nov 1994 08:49:37 GMT` form; older date forms are treated as no usable header), only that host is paused, for at most 60 s, and the page is retried once after the pause. A second slow-down answer, or a requested pause over 60 s, leaves that page `None`. 429/503 without a usable `Retry-After` is an ordinary failure. Hosts are grouped by exact hostname; subdomains of one registered domain are not grouped together (that would need the public suffix list).
+
+Other behaviour: global and per-host limits enforced by a dispatcher (never one task per URL); one shared client; connect 5 s, per-read 5 s, total 20 s; bodies refused above 2 MiB after decompression; declared charset used, UTF-8 fallback otherwise; redirects count as failures; proxies, authenticated pages, robots.txt and an allowlist are out of scope.
 
 ## Python baseline
 

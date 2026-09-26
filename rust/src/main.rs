@@ -1,14 +1,15 @@
 //! Demonstration run against a few public pages. Prints sizes and timing, never page contents.
 //!
-//! Usage: public-page-download [--concurrency N] [--per-host N] [--verbose] [URL ...]
+//! Usage: public-page-download [--concurrency N] [--per-host N] [--min-interval-ms N]
+//! [--verbose] [URL ...]
 
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::prelude::*;
 
-use public_page_download::{DEFAULT_PER_HOST_LIMIT, Limits, download_texts_with_limits};
+use public_page_download::{Limits, download_texts_with_limits};
 
 // Pages chosen because they answer directly; redirects count as failures by design.
 const DEMO_URLS: [&str; 8] = [
@@ -29,10 +30,7 @@ struct Options {
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
-    let mut limits = Limits {
-        max_in_flight: 8,
-        per_host: DEFAULT_PER_HOST_LIMIT,
-    };
+    let mut limits = Limits::default();
     let mut verbose = false;
     let mut urls = Vec::new();
     let mut args = args;
@@ -40,6 +38,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         match arg.as_str() {
             "--concurrency" => limits.max_in_flight = parse_count(args.next(), &arg)?,
             "--per-host" => limits.per_host = parse_count(args.next(), &arg)?,
+            "--min-interval-ms" => {
+                limits.min_interval = args
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(Duration::from_millis)
+                    .ok_or_else(|| format!("{arg} needs a whole number of milliseconds"))?;
+            }
             "--verbose" => verbose = true,
             _ => urls.push(arg),
         }
@@ -95,11 +100,12 @@ async fn main() -> ExitCode {
     let succeeded = results.iter().filter(|text| text.is_some()).count();
     let attempted = f64::from(u32::try_from(results.len()).unwrap_or(u32::MAX));
     println!(
-        "{succeeded}/{} succeeded in {elapsed:.3}s; {:.2} URLs/s (limits: {} in flight, {} per host)",
+        "{succeeded}/{} succeeded in {elapsed:.3}s; {:.2} URLs/s (limits: {} in flight, {} per host, {} ms between starts per host)",
         results.len(),
         attempted / elapsed.max(f64::EPSILON),
         options.limits.max_in_flight,
-        options.limits.per_host,
+        options.limits.per_host.min(options.limits.max_in_flight),
+        options.limits.min_interval.as_millis(),
     );
     ExitCode::SUCCESS
 }
