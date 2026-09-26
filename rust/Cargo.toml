@@ -1,0 +1,16 @@
+[package]
+name = "public-page-download"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Bounded, polite bulk download of public page text for research throughput measurements."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# Exact pins: benchmark results should be reproducible against a known client stack.
+encoding_rs = "=0.8.42"
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "http2", "gzip", "brotli", "deflate"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "ansi", "std", "registry"] }
