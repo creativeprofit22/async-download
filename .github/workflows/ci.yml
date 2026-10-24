@@ -36,7 +36,7 @@ jobs:
         run: cargo fmt --manifest-path rust/Cargo.toml -- --check
 
       # Python baseline (requirements.txt only, no pyproject.toml, so `uv sync` does not apply)
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.1
         with:
           python-version: "3.13"
           enable-cache: true
